@@ -1,270 +1,177 @@
-import tkinter as tk
-from tkinter import scrolledtext, font
-import threading
+
+import os
+import re
+import json
+import math
 import time
-import datetime
 import queue
+import random
+import smtplib
+import datetime
+import threading
+import subprocess
+import webbrowser
 import speech_recognition as sr
 import pyttsx3
-import webbrowser
-import random
-import requests
-import os
-import subprocess
-import math
-import re
-import logging
-from word2number import w2n
+import requests as req
+from ctypes                       import cast, POINTER
+from comtypes                     import CLSCTX_ALL
+from pycaw.pycaw                  import AudioUtilities, IAudioEndpointVolume
+from email.mime.text              import MIMEText
+from email.mime.multipart         import MIMEMultipart
 
-# ============================================
-#   LOGGING
-# ============================================
-logging.basicConfig(
-    filename="sky_errors.log",
-    level=logging.ERROR,
-    format="%(asctime)s — %(levelname)s — %(message)s"
+try:
+    import screen_brightness_control as sbc
+    BRIGHTNESS_AVAILABLE = True
+except Exception:
+    BRIGHTNESS_AVAILABLE = False
+    print("⚠️  Brightness control not available on this display.")
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    DOTENV_AVAILABLE = True
+except ImportError:
+    DOTENV_AVAILABLE = False
+    print("⚠️  python-dotenv not installed. Run: pip install python-dotenv")
+
+
+# ============================================================
+#   LOAD API KEYS FROM .env
+# ============================================================
+
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY",  "your_gemini_api_key_here")
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "your_openweathermap_key_here")
+SENDER_EMAIL    = os.getenv("SENDER_EMAIL",    "youremail@gmail.com")
+SENDER_PASSWORD = os.getenv("SENDER_PASSWORD", "your_gmail_app_password_here")
+
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta"
+    "/models/gemini-1.5-flash:generateContent?key=" + GEMINI_API_KEY
 )
 
-# ============================================
+# Warn if keys are missing
+missing = []
+if "your_gemini"       in GEMINI_API_KEY:  missing.append("GEMINI_API_KEY")
+if "your_openweather"  in WEATHER_API_KEY: missing.append("WEATHER_API_KEY")
+if "youremail"         in SENDER_EMAIL:    missing.append("SENDER_EMAIL")
+if "your_gmail"        in SENDER_PASSWORD: missing.append("SENDER_PASSWORD")
+if missing:
+    print(f"⚠️  Missing in .env: {', '.join(missing)}")
+else:
+    print("✅ All API keys loaded from .env!")
+
+
+# ============================================================
+#   SETTINGS — saved to sky_settings.json
+# ============================================================
+
+SETTINGS_FILE = "sky_settings.json"
+
+DEFAULT_SETTINGS = {
+    "ai_name":        "Sky",
+    "user_name":      "Boss",
+    "voice_index":    2,          # 0=Hazel 1=David 2=Zira
+    "voice_rate":     150,        # speaking speed
+    "wake_words":     ["hey sky", "hi sky", "sky", "wake up"],
+    "default_city":   "Thrissur",
+    "sleep_timeout":  600,        # seconds before auto sleep
+    "contacts": {
+        "mum":  "mum@gmail.com",
+        "dad":  "dad@gmail.com",
+    }
+}
+
+
+def load_settings():
+    """Load settings from JSON file, or create defaults."""
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                saved = json.load(f)
+            # Merge with defaults so new keys always exist
+            merged = DEFAULT_SETTINGS.copy()
+            merged.update(saved)
+            print("✅ Settings loaded from sky_settings.json")
+            return merged
+        except Exception as e:
+            print(f"⚠️  Could not load settings: {e}. Using defaults.")
+    return DEFAULT_SETTINGS.copy()
+
+
+def save_settings():
+    """Save current settings to JSON file."""
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(SETTINGS, f, indent=2)
+        print("✅ Settings saved to sky_settings.json")
+    except Exception as e:
+        print(f"⚠️  Could not save settings: {e}")
+
+
+# Load settings on startup
+SETTINGS = load_settings()
+
+
+# ============================================================
 #   GLOBAL STATE
-# ============================================
+# ============================================================
+
 reminders   = []
+notes       = []
 last_query  = ""
 alert_queue = queue.Queue()
 speak_lock  = threading.Lock()
-notes       = []
-gui         = None   # set after GUI launches
-
-# ============================================
-#   GUI CLASS
-# ============================================
-class SkyDashboard:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Sky — Voice Assistant")
-        self.root.configure(bg="#0f0f14")
-        self.root.geometry("720x600")
-        self.root.resizable(True, True)
-
-        self.is_awake  = False
-        self.listening = False
-
-        self._build_ui()
-
-    # ------------------------------------------
-    #   BUILD UI
-    # ------------------------------------------
-    def _build_ui(self):
-        # ── Header bar ──────────────────────────
-        header = tk.Frame(self.root, bg="#0f0f14", pady=16)
-        header.pack(fill="x", padx=24)
-
-        tk.Label(
-            header, text="SKY", bg="#0f0f14",
-            fg="#7c6fff", font=("Courier New", 28, "bold")
-        ).pack(side="left")
-
-        tk.Label(
-            header, text="voice assistant",
-            bg="#0f0f14", fg="#555566",
-            font=("Courier New", 11)
-        ).pack(side="left", padx=(10, 0), pady=(10, 0))
-
-        # Status pill (right side)
-        self.status_var = tk.StringVar(value="sleeping")
-        self.status_label = tk.Label(
-            header,
-            textvariable=self.status_var,
-            bg="#1e1e2e", fg="#555566",
-            font=("Courier New", 10),
-            padx=12, pady=4,
-            relief="flat"
-        )
-        self.status_label.pack(side="right")
-
-        # ── Listening indicator ─────────────────
-        self.mic_frame = tk.Frame(self.root, bg="#0f0f14")
-        self.mic_frame.pack(fill="x", padx=24)
-
-        self.mic_dot = tk.Label(
-            self.mic_frame, text="●",
-            bg="#0f0f14", fg="#1e1e2e",
-            font=("Courier New", 14)
-        )
-        self.mic_dot.pack(side="left")
-
-        self.mic_label = tk.Label(
-            self.mic_frame, text="say  \"hey sky\"  to wake me up",
-            bg="#0f0f14", fg="#333344",
-            font=("Courier New", 10)
-        )
-        self.mic_label.pack(side="left", padx=(6, 0))
-
-        # ── Divider ─────────────────────────────
-        tk.Frame(self.root, bg="#1e1e2e", height=1).pack(fill="x", padx=24, pady=(12, 0))
-
-        # ── Transcript area ─────────────────────
-        tk.Label(
-            self.root, text="transcript",
-            bg="#0f0f14", fg="#333344",
-            font=("Courier New", 9)
-        ).pack(anchor="w", padx=28, pady=(10, 2))
-
-        self.transcript = scrolledtext.ScrolledText(
-            self.root,
-            bg="#0a0a10", fg="#ccccdd",
-            font=("Courier New", 11),
-            relief="flat",
-            bd=0,
-            padx=16, pady=12,
-            wrap="word",
-            state="disabled",
-            insertbackground="#7c6fff",
-            height=18
-        )
-        self.transcript.pack(fill="both", expand=True, padx=24, pady=(0, 0))
-
-        # Tag colours
-        self.transcript.tag_config("you",  foreground="#7c6fff")
-        self.transcript.tag_config("sky",  foreground="#4ecdc4")
-        self.transcript.tag_config("info", foreground="#555566")
-        self.transcript.tag_config("warn", foreground="#e9c46a")
-
-        # ── Bottom bar ───────────────────────────
-        bottom = tk.Frame(self.root, bg="#0f0f14", pady=12)
-        bottom.pack(fill="x", padx=24)
-
-        self.clock_var = tk.StringVar()
-        tk.Label(
-            bottom, textvariable=self.clock_var,
-            bg="#0f0f14", fg="#333344",
-            font=("Courier New", 9)
-        ).pack(side="left")
-
-        # Reminder count
-        self.reminder_var = tk.StringVar(value="0 reminders")
-        tk.Label(
-            bottom, textvariable=self.reminder_var,
-            bg="#0f0f14", fg="#333344",
-            font=("Courier New", 9)
-        ).pack(side="left", padx=(20, 0))
-
-        # Clear button
-        tk.Button(
-            bottom, text="clear",
-            bg="#1e1e2e", fg="#555566",
-            font=("Courier New", 9),
-            relief="flat", padx=10, pady=2,
-            cursor="hand2",
-            command=self._clear_transcript,
-            activebackground="#2a2a3e",
-            activeforeground="#7c6fff"
-        ).pack(side="right")
-
-        # Start clock
-        self._tick_clock()
-
-        # Welcome message
-        self.log("info", "Sky is ready. Say  \"hey sky\"  to wake me up.")
-
-    # ------------------------------------------
-    #   LOG A LINE TO TRANSCRIPT
-    # ------------------------------------------
-    def log(self, role, text):
-        self.root.after(0, self._insert_line, role, text)
-
-    def _insert_line(self, role, text):
-        self.transcript.config(state="normal")
-
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
-
-        if role == "you":
-            prefix = f"[{ts}]  YOU  →  "
-        elif role == "sky":
-            prefix = f"[{ts}]  SKY  →  "
-        elif role == "warn":
-            prefix = f"[{ts}]  !    →  "
-        else:
-            prefix = f"[{ts}]       →  "
-
-        self.transcript.insert("end", prefix, role)
-        self.transcript.insert("end", text + "\n", role)
-        self.transcript.see("end")
-        self.transcript.config(state="disabled")
-
-    def _clear_transcript(self):
-        self.transcript.config(state="normal")
-        self.transcript.delete("1.0", "end")
-        self.transcript.config(state="disabled")
-
-    # ------------------------------------------
-    #   STATUS + MIC INDICATOR
-    # ------------------------------------------
-    def set_status(self, state):
-        # state: "sleeping" | "listening" | "speaking" | "thinking"
-        colours = {
-            "sleeping":  ("#555566", "#1e1e2e", "#1e1e2e"),
-            "listening": ("#4ecdc4", "#0f2f2d", "#4ecdc4"),
-            "speaking":  ("#7c6fff", "#1a1a2e", "#7c6fff"),
-            "thinking":  ("#e9c46a", "#2a200a", "#e9c46a"),
-        }
-        fg, bg, dot = colours.get(state, colours["sleeping"])
-        self.root.after(0, lambda: [
-            self.status_var.set(state),
-            self.status_label.config(fg=fg, bg=bg),
-            self.mic_dot.config(fg=dot),
-            self.mic_label.config(
-                text={
-                    "sleeping":  "say  \"hey sky\"  to wake me up",
-                    "listening": "listening...",
-                    "speaking":  "speaking...",
-                    "thinking":  "processing...",
-                }.get(state, "")
-            )
-        ])
-
-    def update_reminders(self):
-        count = len(reminders)
-        label = f"{count} reminder{'s' if count != 1 else ''}"
-        self.root.after(0, lambda: self.reminder_var.set(label))
-
-    # ------------------------------------------
-    #   CLOCK
-    # ------------------------------------------
-    def _tick_clock(self):
-        now = datetime.datetime.now().strftime("%A  %d %b  %H:%M:%S")
-        self.clock_var.set(now)
-        self.root.after(1000, self._tick_clock)
 
 
-# ============================================
-#   SPEAK
-# ============================================
+# ============================================================
+#   WORD NUMBERS
+# ============================================================
+
+WORD_NUMBERS = {
+    "zero":0,"one":1,"two":2,"three":3,"four":4,"five":5,
+    "six":6,"seven":7,"eight":8,"nine":9,"ten":10,
+    "eleven":11,"twelve":12,"thirteen":13,"fourteen":14,
+    "fifteen":15,"sixteen":16,"seventeen":17,"eighteen":18,
+    "nineteen":19,"twenty":20,"thirty":30,"forty":40,
+    "fifty":50,"sixty":60,"seventy":70,"eighty":80,
+    "ninety":90,"hundred":100,"thousand":1000,"million":1000000
+}
+
+MATH_WORDS = [
+    "plus","minus","times","divided","multiplied","into","power",
+    "root","percent","factorial","sine","cosine","tangent","log","pi",
+    "+","-","*","/"
+]
+
+
+# ============================================================
+#   SPEAK FUNCTION
+# ============================================================
+
 def speak(text):
     with speak_lock:
-        if gui:
-            gui.log("sky", text)
-            gui.set_status("speaking")
-        print("🤖 Sky:", text)
+        print(f"🤖 {SETTINGS['ai_name']}:", text)
         try:
             engine = pyttsx3.init()
             voices = engine.getProperty('voices')
-            engine.setProperty('voice', voices[2].id if len(voices) > 2 else voices[0].id)
-            engine.setProperty('rate', 150)
+            idx    = SETTINGS.get("voice_index", 2)
+            if idx < len(voices):
+                engine.setProperty('voice', voices[idx].id)
+            engine.setProperty('rate',   SETTINGS.get("voice_rate", 150))
             engine.setProperty('volume', 1.0)
             engine.say(text)
             engine.runAndWait()
             engine.stop()
-            time.sleep(0.3)
+            time.sleep(0.1)
         except Exception as e:
-            logging.error(f"speak() error: {e}")
-        finally:
-            if gui:
-                gui.set_status("listening" if gui.is_awake else "sleeping")
+            print("Speak error:", e)
 
-# ============================================
-#   LISTEN
-# ============================================
+
+# ============================================================
+#   LISTEN FUNCTION
+# ============================================================
+
 def listen(timeout=1000):
     recognizer = sr.Recognizer()
     with sr.Microphone() as source:
@@ -274,8 +181,6 @@ def listen(timeout=1000):
             audio = recognizer.listen(source, timeout=timeout)
             text  = recognizer.recognize_google(audio)
             print("✅ You said:", text)
-            if gui:
-                gui.log("you", text)
             return text.lower()
         except sr.WaitTimeoutError:
             return ""
@@ -285,239 +190,42 @@ def listen(timeout=1000):
             alert_queue.put("Internet connection problem!")
             return ""
 
-# ============================================
-#   CHECK ALERTS
-# ============================================
+
+# ============================================================
+#   CHECK ALERT QUEUE
+# ============================================================
+
 def check_alerts():
     while not alert_queue.empty():
         message = alert_queue.get()
         speak(message)
 
-# ============================================
-#   CHROME SEARCH
-# ============================================
+
+# ============================================================
+#   OPEN CHROME
+# ============================================================
+
 def open_chrome_search(query):
     chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
     url = "https://www.google.com/search?q=" + query.replace(" ", "+")
     try:
         subprocess.Popen([chrome_path, url])
-    except Exception as e:
-        logging.error(f"open_chrome_search() error: {e}")
+    except Exception:
         webbrowser.open(url)
 
-# ============================================
-#   WIKIPEDIA
-# ============================================
-def search_wikipedia(command):
-    global last_query
-    try:
-        query = command.replace("who is",      "")
-        query = query.replace("what is",       "")
-        query = query.replace("what's",        "")
-        query = query.replace("tell me about", "")
-        query = query.replace("wikipedia",     "")
-        query = query.replace("define",        "")
-        query = query.strip()
 
-        if not query:
-            speak("What would you like to know about?")
-            query = listen()
-            if not query:
-                speak("Sorry I did not catch that!")
-                return
+# ============================================================
+#   MATH HELPERS
+# ============================================================
 
-        last_query = query
-        headers    = {'User-Agent': 'SkyAssistant/1.0 (student project)'}
-        found      = False
-
-        try:
-            url      = f"https://en.wikipedia.org/api/rest_v1/page/summary/{query.replace(' ', '_')}"
-            response = requests.get(url, headers=headers, timeout=5)
-            data     = response.json()
-            if "extract" in data and data["extract"] and data.get("type") != "disambiguation":
-                summary       = data["extract"]
-                sentences     = summary.split(". ")
-                short_summary = ". ".join(sentences[:2])
-                if not short_summary.endswith("."):
-                    short_summary += "."
-                speak(short_summary)
-                found = True
-        except Exception as e:
-            logging.error(f"Wikipedia attempt 1: {e}")
-
-        if not found:
-            try:
-                search_url = "https://en.wikipedia.org/w/api.php"
-                params     = {"action": "query", "list": "search", "srsearch": query, "format": "json"}
-                response   = requests.get(search_url, headers=headers, params=params, timeout=5)
-                data       = response.json()
-                results    = data["query"]["search"]
-                if results:
-                    best_title = results[0]["title"]
-                    url2       = f"https://en.wikipedia.org/api/rest_v1/page/summary/{best_title.replace(' ', '_')}"
-                    response2  = requests.get(url2, headers=headers, timeout=5)
-                    data2      = response2.json()
-                    if "extract" in data2 and data2["extract"]:
-                        summary       = data2["extract"]
-                        sentences     = summary.split(". ")
-                        short_summary = ". ".join(sentences[:2])
-                        if not short_summary.endswith("."):
-                            short_summary += "."
-                        speak(short_summary)
-                        found = True
-            except Exception as e:
-                logging.error(f"Wikipedia attempt 2: {e}")
-
-        if not found:
-            speak("Nothing found. Opening Chrome.")
-            open_chrome_search(query)
-
-    except Exception as e:
-        speak("Sorry something went wrong!")
-        logging.error(f"search_wikipedia() error: {e}")
-
-# ============================================
-#   TIME PARSER
-# ============================================
-def parse_time_string(time_str):
-    try:
-        time_str = time_str.strip().lower()
-        period   = "PM" if ("p.m" in time_str or " pm" in time_str) else "AM"
-        for rep in ["p.m.", "a.m.", "pm", "am", "p m", "a m"]:
-            time_str = time_str.replace(rep, "")
-        time_str = time_str.replace(".", "").replace(":", " ").strip()
-        parts    = time_str.split()
-        if not parts:
-            return None
-        if len(parts) == 1:
-            num = parts[0]
-            if len(num) <= 2:
-                hour, minute = num.zfill(2), "00"
-            elif len(num) == 3:
-                hour, minute = num[0].zfill(2), num[1:]
-            elif len(num) == 4:
-                hour, minute = num[:2], num[2:]
-            else:
-                return None
-        else:
-            hour, minute = parts[0].zfill(2), parts[1].zfill(2)
-        return f"{hour}:{minute} {period}"
-    except Exception as e:
-        logging.error(f"parse_time_string() error: {e}")
-        return None
-
-# ============================================
-#   REMINDER CHECKER
-# ============================================
-def check_reminders():
-    while True:
-        now = datetime.datetime.now().strftime("%I:%M %p").lower()
-        for reminder in reminders[:]:
-            if reminder["time"] == now:
-                alert_queue.put(f"Reminder alert! {reminder['task']}")
-                reminders.remove(reminder)
-                if gui:
-                    gui.update_reminders()
-        time.sleep(30)
-
-# ============================================
-#   SET REMINDER
-# ============================================
-def set_reminder(command):
-    try:
-        for phrase in ["set a reminder to","set a reminder","set reminder to",
-                       "set reminder","remind me to","remind me"]:
-            command = command.replace(phrase, "")
-        command = command.strip()
-
-        if "at" in command:
-            parts         = command.split("at")
-            task          = parts[0].strip() or None
-            time_str      = parts[1].strip()
-            if not task:
-                speak("What would you like me to remind you about?")
-                task = listen()
-                if not task:
-                    speak("Sorry I did not catch that!")
-                    return
-                task = task.replace("to", "").strip()
-            reminder_time = parse_time_string(time_str)
-        else:
-            task = command.strip()
-            if not task:
-                speak("What would you like me to remind you about?")
-                task = listen()
-                if not task:
-                    speak("Sorry I did not catch that!")
-                    return
-                task = task.replace("to", "").strip()
-            speak(f"Sure! What time should I remind you to {task}?")
-            time_response = listen()
-            if not time_response:
-                speak("Sorry I did not catch the time!")
-                return
-            time_str      = time_response.replace("at", "").strip()
-            reminder_time = parse_time_string(time_str)
-
-        if reminder_time is None:
-            speak("Sorry I could not understand the time!")
-            return
-
-        reminders.append({"task": task, "time": reminder_time.lower()})
-        if gui:
-            gui.update_reminders()
-        speak(f"Reminder set! I will remind you to {task} at {reminder_time}")
-
-    except Exception as e:
-        speak("Sorry I could not set that reminder!")
-        logging.error(f"set_reminder() error: {e}")
-
-def show_reminders():
-    if not reminders:
-        speak("You have no reminders set!")
-    else:
-        speak(f"You have {len(reminders)} reminders.")
-        for i, r in enumerate(reminders):
-            speak(f"Reminder {i+1}: {r['task']} at {r['time']}")
-
-# ============================================
-#   TIMER
-# ============================================
-def set_timer(command):
-    try:
-        for phrase in ["set a timer for","start timer for","set timer for",
-                       "set a timer","set timer","timer for"]:
-            command = command.replace(phrase, "")
-        command = command.strip()
-        parts   = command.split()
-        number  = int(parts[0])
-        if "second" in command:
-            total_seconds, unit = number, "seconds"
-        elif "minute" in command:
-            total_seconds, unit = number * 60, "minutes"
-        elif "hour" in command:
-            total_seconds, unit = number * 3600, "hours"
-        else:
-            speak("Please say seconds minutes or hours!")
-            return
-        speak(f"Timer started for {number} {unit}!")
-        if gui:
-            gui.log("info", f"Timer: {number} {unit}")
-        def timer_thread():
-            time.sleep(total_seconds)
-            alert_queue.put(f"Time is up! Your {number} {unit} timer is done!")
-        threading.Thread(target=timer_thread, daemon=True).start()
-    except Exception as e:
-        speak("Sorry I could not set that timer!")
-        logging.error(f"set_timer() error: {e}")
-
-# ============================================
-#   WORD NUMBER CONVERTER
-# ============================================
 def convert_word_numbers(text):
-    operators = ["plus","minus","times","into","multiplied by","divided by","to the power of"]
-    tokens    = re.split(
-        r'(\bplus\b|\bminus\b|\btimes\b|\binto\b|\bmultiplied by\b|\bdivided by\b|\bto the power of\b)',
+    operator_words = [
+        "plus","minus","times","into",
+        "multiplied by","divided by","to the power of"
+    ]
+    tokens = re.split(
+        r'(\bplus\b|\bminus\b|\btimes\b|\binto\b'
+        r'|\bmultiplied by\b|\bdivided by\b|\bto the power of\b)',
         text
     )
     result = []
@@ -525,46 +233,646 @@ def convert_word_numbers(text):
         token = token.strip()
         if not token:
             continue
-        if token in operators:
+        if token in operator_words:
             result.append(token)
         else:
-            try:
-                result.append(str(w2n.word_to_num(token)))
-            except:
-                result.append(token)
+            chunk = token
+            for word, value in sorted(
+                WORD_NUMBERS.items(), key=lambda x: len(x[0]), reverse=True
+            ):
+                if word in chunk:
+                    chunk = chunk.replace(word, str(value), 1)
+            result.append(chunk)
     return " ".join(result)
 
-# ============================================
-#   MATH DETECTION
-# ============================================
-MATH_WORDS = [
-    "plus","minus","times","divided","multiplied","into","power",
-    "root","percent","factorial","sine","cosine","tangent","log","pi",
-    "+","-","*","/"
-]
-WORD_NUMS = [
-    "zero","one","two","three","four","five","six","seven","eight","nine","ten",
-    "eleven","twelve","thirteen","fourteen","fifteen","sixteen","seventeen",
-    "eighteen","nineteen","twenty","thirty","forty","fifty","sixty","seventy",
-    "eighty","ninety","hundred","thousand","million"
-]
 
 def is_math_question(command):
-    has_math   = any(w in command for w in MATH_WORDS)
-    has_digit  = any(c.isdigit() for c in command)
-    has_wordnum= any(w in command for w in WORD_NUMS)
+    has_math    = any(w in command for w in MATH_WORDS)
+    has_digit   = any(c.isdigit() for c in command)
+    has_wordnum = any(w in command for w in WORD_NUMBERS)
     return has_math and (has_digit or has_wordnum)
 
-# ============================================
-#   CALCULATOR
-# ============================================
-def calculate(command):
+
+def extract_number(text):
+    match = re.search(r'(\d+)', text)
+    if match:
+        return int(match.group(1))
+    for word, value in sorted(
+        WORD_NUMBERS.items(), key=lambda x: len(x[0]), reverse=True
+    ):
+        if word in text.lower():
+            return value
+    return None
+
+
+# ============================================================
+#   TIME PARSER
+# ============================================================
+
+def parse_time_string(time_str):
     try:
-        expression = command.replace("calculate","").replace("what's","") \
-                            .replace("what is","").replace("the","").strip()
+        t = time_str.strip().lower()
+        if "p.m" in t or t.endswith("pm") or " pm" in t:
+            period = "PM"
+        else:
+            period = "AM"
+        for marker in ["p.m.","a.m."," pm"," am","pm","am","p m","a m"]:
+            t = t.replace(marker, "")
+        t     = t.replace(".", "").replace(":", " ").strip()
+        parts = t.split()
+        if not parts or not parts[0].isdigit():
+            return None
+        if len(parts) == 1:
+            num = parts[0]
+            if   len(num) <= 2: hour, minute = num.zfill(2), "00"
+            elif len(num) == 3: hour, minute = num[0].zfill(2), num[1:]
+            elif len(num) == 4: hour, minute = num[:2], num[2:]
+            else: return None
+        else:
+            hour   = parts[0].zfill(2)
+            minute = parts[1].zfill(2) if parts[1].isdigit() else "00"
+        return f"{hour}:{minute} {period}"
+    except Exception as e:
+        print("Time parse error:", e)
+        return None
+
+
+# ============================================================
+#   GEMINI AI — UNDERSTAND COMMAND
+# ============================================================
+
+NLP_SYSTEM_PROMPT = """
+You are the brain of a voice assistant.
+The user will say something and you must figure out what they want.
+
+Reply ONLY with a valid JSON object — nothing else.
+No explanation, no preamble, no markdown. Just raw JSON.
+
+JSON structure:
+{
+  "intent":     "<intent>",
+  "contact":    "<name if emailing, else null>",
+  "topic":      "<search topic, else null>",
+  "city":       "<city name if weather, else null>",
+  "task":       "<reminder or note content, else null>",
+  "time":       "<reminder time e.g. 3 pm, else null>",
+  "duration":   "<timer duration e.g. 5 minutes, else null>",
+  "expression": "<math expression, else null>",
+  "app":        "<app name if opening, else null>",
+  "reply":      "<short friendly reply for small talk, else null>",
+  "value":      "<number value for volume/brightness, else null>",
+  "action":     "<increase/decrease/set/mute/unmute/max/min/check, else null>",
+  "setting":    "<what setting to change: ai_name/user_name/voice/speed/wake_word, else null>",
+  "new_value":  "<the new value for the setting, else null>"
+}
+
+Valid intents:
+- greeting, how_are_you, name, time, date, time_and_date
+- reminder_set, reminder_show
+- timer
+- note_take, note_show
+- send_email
+- calculate
+- weather
+- wikipedia
+- search
+- open_app
+- volume_control      (turn up volume, mute, set volume to 50)
+- brightness_control  (increase brightness, dim screen, set brightness 70)
+- change           (change your name, change my name, change voice, change speed, add wake word)
+- add_contact         (add contact, save contact, new contact)
+- joke
+- sleep
+- small_talk
+- unknown
+"""
+
+
+def understand_command(command):
+    try:
+        payload = {
+            "contents": [{
+                "parts": [{
+                    "text": NLP_SYSTEM_PROMPT
+                            + "\n\nUser said: " + command
+                }]
+            }],
+            "generationConfig": {
+                "temperature":     0.1,
+                "maxOutputTokens": 300
+            }
+        }
+        response = req.post(GEMINI_URL, json=payload, timeout=8)
+        data     = response.json()
+        raw      = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        raw      = raw.replace("```json","").replace("```","").strip()
+        result   = json.loads(raw)
+        print(f"🧠 Gemini: {result}")
+        return result
+    except Exception as e:
+        print(f"⚠️  Gemini error — keyword fallback: {e}")
+        return fallback_understand(command)
+
+
+def fallback_understand(command):
+    c = command.lower()
+    if any(w in c for w in ["hello","hi there","hey"]):
+        return {"intent":"greeting"}
+    elif "how are you" in c:
+        return {"intent":"how_are_you"}
+    elif "your name" in c:
+        return {"intent":"name"}
+    elif "change" in c:
+        return {"intent":"change"}
+    elif "time" in c and "date" in c:
+        return {"intent":"time_and_date"}
+    elif "time" in c and "timer" not in c:
+        return {"intent":"time"}
+    elif "date" in c:
+        return {"intent":"date"}
+    elif ("show" in c or "list" in c or "my" in c) and "reminder" in c:
+        return {"intent":"reminder_show"}
+    elif "reminder" in c or "remind me" in c:
+        return {"intent":"reminder_set","task":None,"time":None}
+    elif "timer" in c:
+        return {"intent":"timer","duration":c}
+    elif ("show" in c or "read" in c) and "note" in c:
+        return {"intent":"note_show"}
+    elif any(p in c for p in ["take a note","make a note","note down","save note"]):
+        return {"intent":"note_take","task":c}
+    elif "email" in c or "send mail" in c:
+        return {"intent":"send_email","contact":None}
+    elif "add contact" in c or "save contact" in c or "new contact" in c:
+        return {"intent":"add_contact"}
+    elif "calculate" in c or is_math_question(c):
+        return {"intent":"calculate","expression":c}
+    elif "weather" in c:
+        city = c.split("in")[-1].strip() if "in" in c else SETTINGS["default_city"]
+        return {"intent":"weather","city":city}
+    elif "search" in c:
+        topic = c.split("search for")[-1].strip() if "search for" in c \
+                else c.split("search")[-1].strip()
+        return {"intent":"search","topic":topic}
+    elif any(p in c for p in ["who is","tell me about","wikipedia","define","what is"]):
+        return {"intent":"wikipedia","topic":c}
+    elif "open" in c:
+        return {"intent":"open_app","app":c.replace("open","").strip()}
+    elif any(w in c for w in ["volume","mute","unmute","louder","quieter"]):
+        return {"intent":"volume_control","task":c,"action":None,"value":None}
+    elif any(w in c for w in ["brightness","brighter","dimmer","dim"]):
+        return {"intent":"brightness_control","task":c,"action":None,"value":None}
+    elif any(w in c for w in ["change your name","change my name","change voice",
+                               "change speed","change wake word","customize"]):
+        return {"intent":"customize","setting":None,"new_value":None}
+    elif "joke" in c:
+        return {"intent":"joke"}
+    elif any(p in c for p in ["bye","exit","go to sleep","goodbye"]):
+        return {"intent":"sleep"}
+    else:
+        return {"intent":"unknown"}
+
+
+# ============================================================
+#   VOLUME CONTROL
+# ============================================================
+
+def control_volume(command, action=None, value=None):
+    try:
+        devices   = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        volume    = cast(interface, POINTER(IAudioEndpointVolume))
+
+        current_vol = round(volume.GetMasterVolumeLevelScalar() * 100)
+        cmd         = (command or "").lower()
+
+        # Determine action from command if Gemini didn't extract it
+        if not action:
+            if "mute" in cmd and "unmute" not in cmd: action = "mute"
+            elif "unmute" in cmd:                      action = "unmute"
+            elif "set" in cmd or "to" in cmd:          action = "set"
+            elif any(w in cmd for w in ["up","increase","raise","louder","higher"]): action = "increase"
+            elif any(w in cmd for w in ["down","decrease","lower","quieter"]):       action = "decrease"
+            elif any(w in cmd for w in ["what","check","current"]):                  action = "check"
+            else:                                                                     action = "check"
+
+        if action == "mute":
+            volume.SetMute(1, None)
+            speak("PC muted!")
+
+        elif action == "unmute":
+            volume.SetMute(0, None)
+            speak("PC unmuted!")
+
+        elif action == "set":
+            number = value or extract_number(cmd)
+            if number is None:
+                speak("What volume level? Say a number between 0 and 100.")
+                resp = listen(timeout=10)
+                number = extract_number(resp) or 50
+            number = max(0, min(100, int(number)))
+            volume.SetMasterVolumeLevelScalar(number / 100, None)
+            speak(f"Volume set to {number} percent!")
+
+        elif action == "increase":
+            number  = value or extract_number(cmd) or 10
+            new_vol = min(100, current_vol + int(number))
+            volume.SetMasterVolumeLevelScalar(new_vol / 100, None)
+            speak(f"Volume increased to {new_vol} percent!")
+
+        elif action == "decrease":
+            number  = value or extract_number(cmd) or 10
+            new_vol = max(0, current_vol - int(number))
+            volume.SetMasterVolumeLevelScalar(new_vol / 100, None)
+            speak(f"Volume decreased to {new_vol} percent!")
+
+        elif action == "check":
+            speak(f"Current volume is {current_vol} percent.")
+
+    except Exception as e:
+        speak("Sorry, I could not control the volume!")
+        print("Volume error:", e)
+
+
+# ============================================================
+#   BRIGHTNESS CONTROL
+# ============================================================
+
+def control_brightness(command, action=None, value=None):
+    if not BRIGHTNESS_AVAILABLE:
+        speak("Sorry, brightness control is not available on this display.")
+        return
+    try:
+        current = sbc.get_brightness()[0]
+        cmd     = (command or "").lower()
+
+        if not action:
+            if "set" in cmd or "to" in cmd:                                          action = "set"
+            elif any(w in cmd for w in ["up","increase","raise","brighter","higher"]): action = "increase"
+            elif any(w in cmd for w in ["down","decrease","lower","dimmer","dim"]):    action = "decrease"
+            elif "max" in cmd or "maximum" in cmd or "full" in cmd:                   action = "max"
+            elif "min" in cmd or "minimum" in cmd:                                    action = "min"
+            elif any(w in cmd for w in ["what","check","current"]):                   action = "check"
+            else:                                                                      action = "check"
+
+        if action == "set":
+            number = value or extract_number(cmd)
+            if number is None:
+                speak("What brightness level? Say a number between 0 and 100.")
+                resp   = listen(timeout=10)
+                number = extract_number(resp) or 70
+            number = max(0, min(100, int(number)))
+            sbc.set_brightness(number)
+            speak(f"Brightness set to {number} percent!")
+
+        elif action == "increase":
+            number  = value or extract_number(cmd) or 10
+            new_val = min(100, current + int(number))
+            sbc.set_brightness(new_val)
+            speak(f"Brightness increased to {new_val} percent!")
+
+        elif action == "decrease":
+            number  = value or extract_number(cmd) or 10
+            new_val = max(10, current - int(number))
+            sbc.set_brightness(new_val)
+            speak(f"Brightness decreased to {new_val} percent!")
+
+        elif action == "max":
+            sbc.set_brightness(100)
+            speak("Brightness set to maximum!")
+
+        elif action == "min":
+            sbc.set_brightness(10)
+            speak("Brightness set to minimum!")
+
+        elif action == "check":
+            speak(f"Current brightness is {current} percent.")
+
+    except Exception as e:
+        speak("Sorry, I could not control the brightness!")
+        print("Brightness error:", e)
+
+
+# ============================================================
+#   CUSTOMIZATION
+# ============================================================
+
+def customize(setting, new_value, command=""):
+    """
+    Let the user change AI name, their own name,
+    voice, speed, or wake words — all by voice!
+    """
+    global SETTINGS
+
+    cmd = (command or "").lower()
+
+    # Ask what to change if Gemini didn't detect it
+    if not setting:
+        speak(
+            "What would you like to customize? "
+            "You can say: my name, your name, voice, speed, or wake word."
+        )
+        resp    = listen(timeout=15)
+        setting = resp.lower() if resp else ""
+
+    # ── CHANGE AI NAME ──────────────────────────────────────
+    if any(w in setting for w in ["your name","ai name","assistant name"]):
+        if not new_value:
+            speak(f"What would you like to call me instead of {SETTINGS['ai_name']}?")
+            new_value = listen(timeout=10)
+        if new_value:
+            new_value = new_value.strip().title()
+            old_name  = SETTINGS["ai_name"]
+            SETTINGS["ai_name"] = new_value
+            # Update wake words to use new name automatically
+            SETTINGS["wake_words"] = [
+                f"hey {new_value.lower()}",
+                f"hi {new_value.lower()}",
+                new_value.lower(),
+                "wake up"
+            ]
+            save_settings()
+            speak(f"Done! You can now call me {new_value} instead of {old_name}!")
+        else:
+            speak("Sorry, I did not catch the new name!")
+
+    # ── CHANGE USER NAME ────────────────────────────────────
+    elif any(w in setting for w in ["my name","user name","your name is wrong","call me"]):
+        if not new_value:
+            speak(f"What should I call you instead of {SETTINGS['user_name']}?")
+            new_value = listen(timeout=10)
+        if new_value:
+            new_value = new_value.strip().title()
+            SETTINGS["user_name"] = new_value
+            save_settings()
+            speak(f"Got it! I will call you {new_value} from now on!")
+        else:
+            speak("Sorry, I did not catch your name!")
+
+    # ── CHANGE VOICE ────────────────────────────────────────
+    elif "voice" in setting:
+        engine = pyttsx3.init()
+        voices = engine.getProperty('voices')
+        engine.stop()
+
+        # List available voices
+        voice_list = ""
+        for i, v in enumerate(voices):
+            voice_list += f"Voice {i}: {v.name}. "
+
+        speak(f"Available voices are: {voice_list} Which number would you like?")
+        resp = listen(timeout=10)
+        num  = extract_number(resp or "")
+
+        if num is not None and 0 <= num < len(voices):
+            SETTINGS["voice_index"] = num
+            save_settings()
+            speak(f"Voice changed! This is my new voice. Voice number {num}.")
+        else:
+            speak("Sorry, I did not catch a valid voice number!")
+
+    # ── CHANGE SPEED ────────────────────────────────────────
+    elif any(w in setting for w in ["speed","rate","faster","slower"]):
+        speak(
+            "What speed would you like? "
+            "Say slow for 120, normal for 150, or fast for 190."
+        )
+        resp = listen(timeout=10)
+        resp = (resp or "").lower()
+
+        if "slow" in resp:
+            rate = 120
+        elif "fast" in resp:
+            rate = 190
+        elif "normal" in resp:
+            rate = 150
+        else:
+            num = extract_number(resp)
+            rate = num if num else 150
+
+        SETTINGS["voice_rate"] = rate
+        save_settings()
+        speak(f"Speed set to {rate}. How does this sound?")
+
+    # ── CHANGE DEFAULT CITY ─────────────────────────────────
+    elif any(w in setting for w in ["city","location","home city","default city"]):
+        if not new_value:
+            speak("What city should I use as your default for weather?")
+            new_value = listen(timeout=10)
+        if new_value:
+            SETTINGS["default_city"] = new_value.strip().title()
+            save_settings()
+            speak(f"Default city set to {SETTINGS['default_city']}!")
+        else:
+            speak("Sorry, I did not catch the city name!")
+
+    # ── ADD WAKE WORD ───────────────────────────────────────
+    elif any(w in setting for w in ["wake word","wake up word","trigger word"]):
+        if not new_value:
+            speak("What new wake word would you like to add?")
+            new_value = listen(timeout=10)
+        if new_value:
+            new_value = new_value.strip().lower()
+            if new_value not in SETTINGS["wake_words"]:
+                SETTINGS["wake_words"].append(new_value)
+                save_settings()
+                speak(f"Wake word added! You can now say {new_value} to wake me up!")
+            else:
+                speak(f"{new_value} is already a wake word!")
+        else:
+            speak("Sorry, I did not catch the wake word!")
+
+    # ── SHOW CURRENT SETTINGS ───────────────────────────────
+    elif any(w in setting for w in ["settings","preferences","show","what are"]):
+        speak(
+            f"Here are your current settings. "
+            f"My name is {SETTINGS['ai_name']}. "
+            f"I call you {SETTINGS['user_name']}. "
+            f"Voice index is {SETTINGS['voice_index']}. "
+            f"Speed is {SETTINGS['voice_rate']}. "
+            f"Default city is {SETTINGS['default_city']}. "
+            f"Wake words are {', '.join(SETTINGS['wake_words'])}."
+        )
+
+    else:
+        speak(
+            "I can change: my name, your name, voice, speed, "
+            "default city, or wake word. Which one?"
+        )
+
+
+# ============================================================
+#   ADD EMAIL CONTACT BY VOICE
+# ============================================================
+
+def add_contact(command=""):
+    """Let the user add a new email contact by voice."""
+    try:
+        speak("What is the contact's name?")
+        name = listen(timeout=10)
+        if not name:
+            speak("Sorry, I did not catch the name!")
+            return
+        name = name.strip().lower()
+
+        speak(f"What is {name}'s email address? Please say it clearly.")
+        email_raw = listen(timeout=15)
+        if not email_raw:
+            speak("Sorry, I did not catch the email address!")
+            return
+
+        # Clean up spoken email:
+        # "john at gmail dot com" → "john@gmail.com"
+        email = (email_raw.strip()
+                 .replace(" at ",       "@")
+                 .replace(" dot ",      ".")
+                 .replace(" underscore","_")
+                 .replace(" hyphen",    "-")
+                 .replace(" dash",      "-")
+                 .replace(" ",          ""))
+
+        speak(
+            f"I will save {name} with email {email}. "
+            "Say yes to confirm or no to cancel."
+        )
+        confirm = listen(timeout=2000)
+
+        if confirm and any(w in confirm for w in ["yes","okay","ok","sure","go ahead"]):
+            SETTINGS["contacts"][name] = email
+            save_settings()
+            speak(f"Contact saved! {name} is now in your contacts.")
+            print(f"✅ Contact added: {name} → {email}")
+        else:
+            speak("Contact not saved.")
+
+    except Exception as e:
+        speak("Sorry, I could not add that contact!")
+        print("Add contact error:", e)
+
+
+# ============================================================
+#   REMINDER CHECKER — background thread
+# ============================================================
+
+def check_reminders():
+    while True:
+        now = datetime.datetime.now().strftime("%I:%M %p").lower()
+        for reminder in reminders[:]:
+            if reminder["time"] == now:
+                alert_queue.put(f"Hey {SETTINGS['user_name']}! Reminder: {reminder['task']}")
+                reminders.remove(reminder)
+        time.sleep(30)
+
+
+# ============================================================
+#   SET REMINDER
+# ============================================================
+
+def set_reminder(task, reminder_time):
+    try:
+        if not task:
+            speak("What would you like me to remind you about?")
+            task = listen(timeout=15)
+            if not task:
+                speak("Sorry, I did not catch that!")
+                return
+            task = task.replace("to","").strip()
+
+        if not reminder_time:
+            speak(f"What time should I remind you to {task}?")
+            time_response = listen(timeout=15)
+            if not time_response:
+                speak("Sorry, I did not catch the time!")
+                return
+            reminder_time = time_response.replace("at","").strip()
+
+        parsed = parse_time_string(reminder_time)
+        if not parsed:
+            speak("Sorry, I could not understand that time. Try saying 3 PM or 10 30 AM.")
+            return
+
+        reminders.append({"task": task, "time": parsed.lower()})
+        speak(f"Reminder set! I will remind you to {task} at {parsed}.")
+        print(f"✅ Reminder saved: {task} at {parsed}")
+
+    except Exception as e:
+        speak("Sorry, I could not set that reminder!")
+        print("Reminder error:", e)
+
+
+def show_reminders():
+    if not reminders:
+        speak("You have no reminders set!")
+    else:
+        speak(f"You have {len(reminders)} reminder{'s' if len(reminders) != 1 else ''}.")
+        for i, r in enumerate(reminders):
+            speak(f"Reminder {i+1}: {r['task']} at {r['time']}.")
+
+
+# ============================================================
+#   TIMER
+# ============================================================
+
+def set_timer(duration_str):
+    try:
+        if not duration_str or not duration_str.strip():
+            speak("How long should I set the timer for?")
+            duration_str = listen(timeout=15)
+            if not duration_str:
+                speak("Sorry, I did not catch the duration!")
+                return
+
+        duration_text = duration_str.lower().strip()
+        number        = extract_number(duration_text)
+
+        if number is None:
+            speak("Sorry, I could not find a number. Try saying 5 minutes or ten seconds.")
+            return
+
+        if "second" in duration_text:
+            total_seconds = number
+            unit          = "second" if number == 1 else "seconds"
+        elif "minute" in duration_text:
+            total_seconds = number * 60
+            unit          = "minute" if number == 1 else "minutes"
+        elif "hour" in duration_text:
+            total_seconds = number * 3600
+            unit          = "hour" if number == 1 else "hours"
+        else:
+            speak("Please say seconds, minutes, or hours.")
+            return
+
+        speak(f"Timer started for {number} {unit}!")
+
+        def timer_thread():
+            time.sleep(total_seconds)
+            alert_queue.put(
+                f"Hey {SETTINGS['user_name']}! "
+                f"Time is up! Your {number} {unit} timer is done!"
+            )
+
+        threading.Thread(target=timer_thread, daemon=True).start()
+
+    except Exception as e:
+        speak("Sorry, I could not start that timer!")
+        print("Timer error:", e)
+
+
+# ============================================================
+#   CALCULATOR
+# ============================================================
+
+def calculate(expression):
+    try:
+        expression = (expression
+            .replace("calculate","")
+            .replace("what's",   "")
+            .replace("what is",  "")
+            .replace("the",      "")
+            .strip()
+        )
         expression = convert_word_numbers(expression)
 
-        if expression == "pi" or "value of pi" in expression:
+        if expression.strip() in ("pi","value of pi"):
             speak(f"Pi is approximately {round(math.pi, 5)}")
             return
         if "square root of" in expression:
@@ -606,48 +914,54 @@ def calculate(command):
             speak(f"Log of {n} is {round(math.log10(n),4)}")
             return
 
-        expression = expression.replace("plus","+").replace("minus","-") \
-                               .replace("multiplied by","*").replace("multiply by","*") \
-                               .replace("times","*").replace("into","*") \
-                               .replace("divided by","/").replace("divide by","/") \
-                               .replace("to the power of","**").replace("to the power","**") \
-                               .replace("power","**").replace(" by","")
-
+        expression = (expression
+            .replace("plus","+").replace("minus","-")
+            .replace("multiplied by","*").replace("multiply by","*")
+            .replace("times","*").replace("into","*")
+            .replace("divided by","/").replace("divide by","/")
+            .replace("to the power of","**").replace("to the power","**")
+            .replace("power","**").replace(" by","")
+        )
         result = round(eval(expression), 4)
         speak(f"The answer is {result}")
 
     except ZeroDivisionError:
-        speak("Sorry you cannot divide by zero!")
+        speak("Sorry, you cannot divide by zero!")
     except Exception as e:
-        speak("Sorry I could not calculate that!")
-        logging.error(f"calculate() error: {e}")
+        speak("Sorry, I could not calculate that!")
+        print("Calc error:", e)
 
-# ============================================
+
+# ============================================================
 #   NOTE TAKING
-# ============================================
-def take_note(command):
+# ============================================================
+
+def take_note(task):
     try:
-        for phrase in ["take a note","make a note","note down","save note"]:
-            command = command.replace(phrase, "")
-        note_text = command.strip()
+        note_text = (task or "").replace("take a note","").replace("make a note","") \
+                                .replace("note down","").replace("save note","") \
+                                .replace("remember","").strip()
         if not note_text:
             speak("What would you like me to note down?")
-            note_text = listen()
+            note_text = listen(timeout=15)
             if not note_text:
-                speak("Sorry I did not catch that!")
+                speak("Sorry, I did not catch that!")
                 return
-            note_text = note_text.replace("to","").strip()
+
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %I:%M %p")
         entry     = f"[{timestamp}] {note_text}"
         notes.append(entry)
+
         with open("sky_notes.txt", "a") as f:
             f.write(entry + "\n")
+
         speak(f"Got it! I have noted: {note_text}")
-        if gui:
-            gui.log("info", f"Note saved: {note_text}")
+        print(f"📝 Note saved: {entry}")
+
     except Exception as e:
-        speak("Sorry I could not save that note!")
-        logging.error(f"take_note() error: {e}")
+        speak("Sorry, I could not save that note!")
+        print("Note error:", e)
+
 
 def show_notes():
     try:
@@ -659,97 +973,279 @@ def show_notes():
         if not lines:
             speak("You have no notes saved yet!")
             return
-        speak(f"You have {len(lines)} notes. Here are the last five.")
+        total = len(lines)
+        speak(f"You have {total} note{'s' if total != 1 else ''}. "
+              f"Here are the last {'five' if total > 5 else total}.")
         for i, line in enumerate(lines[-5:]):
             speak(f"Note {i+1}: {line.strip()}")
     except Exception as e:
-        speak("Sorry I could not read your notes!")
-        logging.error(f"show_notes() error: {e}")
+        speak("Sorry, I could not read your notes!")
+        print("Notes error:", e)
 
-# ============================================
-#   OPEN APPS
-# ============================================
-def open_app(command):
+
+# ============================================================
+#   SEND EMAIL
+# ============================================================
+
+def send_email(contact_name):
     try:
-        apps = {
-            "notepad":      ("notepad.exe",     "Opening Notepad!"),
-            "chrome":       ("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "Opening Chrome!"),
-            "explorer":     ("explorer.exe",    "Opening File Explorer!"),
-            "files":        ("explorer.exe",    "Opening File Explorer!"),
-            "calculator":   ("calc.exe",        "Opening Calculator!"),
-            "excel":        ("excel.exe",       "Opening Excel!"),
-            "word":         ("winword.exe",     "Opening Word!"),
-            "task manager": ("taskmgr.exe",     "Opening Task Manager!"),
-        }
-        for key, (exe, msg) in apps.items():
-            if key in command:
-                speak(msg)
-                if key == "camera":
-                    subprocess.Popen("start microsoft.windows.camera:", shell=True)
-                else:
-                    os.startfile(exe)
+        recipient_email = None
+        recipient_name  = None
+        contacts        = SETTINGS.get("contacts", {})
+
+        if contact_name:
+            for name, address in contacts.items():
+                if name in contact_name.lower():
+                    recipient_name  = name
+                    recipient_email = address
+                    break
+
+        if not recipient_email:
+            speak("Who would you like to send the email to?")
+            spoken_name = listen(timeout=15)
+            if not spoken_name:
+                speak("Sorry, I did not catch that!")
                 return
-        speak("Sorry I don't know how to open that app yet!")
-    except Exception as e:
-        speak("Sorry I could not open that app!")
-        logging.error(f"open_app() error: {e}")
+            for name, address in contacts.items():
+                if name in spoken_name.lower():
+                    recipient_name  = name
+                    recipient_email = address
+                    break
 
-# ============================================
-#   WEATHER
-# ============================================
-def get_weather(city):
-    api_key = "your_api_key_here"   # ← paste your OpenWeatherMap key!
-    url     = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric"
+        if not recipient_email:
+            speak(
+                "Sorry, I could not find that person in your contacts. "
+                "Try saying add contact to add them first!"
+            )
+            return
+
+        speak(f"What is the subject of the email to {recipient_name}?")
+        subject = listen(timeout=20)
+        if not subject:
+            speak("Sorry, I did not catch the subject!")
+            return
+
+        speak("What should the email say?")
+        body = listen(timeout=30)
+        if not body:
+            speak("Sorry, I did not catch the message!")
+            return
+
+        speak(
+            f"I will send an email to {recipient_name} "
+            f"with subject: {subject}. "
+            "Say yes to confirm or no to cancel."
+        )
+        confirmation = listen(timeout=10)
+
+        if not confirmation or not any(
+            w in confirmation for w in ["yes","send","go","okay","ok"]
+        ):
+            speak("Okay, email cancelled!")
+            return
+
+        msg            = MIMEMultipart()
+        msg["From"]    = SENDER_EMAIL
+        msg["To"]      = recipient_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.sendmail(SENDER_EMAIL, recipient_email, msg.as_string())
+
+        speak(f"Email sent to {recipient_name} successfully!")
+        print(f"✅ Email sent to {recipient_email}")
+
+    except smtplib.SMTPAuthenticationError:
+        speak(
+            "Authentication failed! Please check your Gmail address "
+            "and App Password in the .env file."
+        )
+    except Exception as e:
+        speak("Sorry, something went wrong with the email!")
+        print(f"Email error: {e}")
+
+
+# ============================================================
+#   WIKIPEDIA
+# ============================================================
+
+def search_wikipedia(topic):
+    global last_query
     try:
-        response = requests.get(url)
+        query = (topic or "").strip()
+        for phrase in ["who is","what is","what's","tell me about",
+                       "wikipedia","define"]:
+            query = query.replace(phrase, "").strip()
+
+        if not query:
+            speak("What would you like to know about?")
+            query = listen(timeout=15)
+            if not query:
+                speak("Sorry, I did not catch that!")
+                return
+
+        last_query = query
+        headers    = {'User-Agent': 'SkyAssistant/1.0 (student project)'}
+        found      = False
+
+        # Attempt 1 — direct lookup
+        try:
+            url      = ("https://en.wikipedia.org/api/rest_v1/page/summary/"
+                        + query.replace(" ", "_"))
+            response = req.get(url, headers=headers, timeout=5)
+            data     = response.json()
+            if ("extract" in data and data["extract"]
+                    and data.get("type") != "disambiguation"):
+                summary = data["extract"]
+                short   = ". ".join(summary.split(". ")[:2])
+                if not short.endswith("."): short += "."
+                speak(short)
+                found = True
+        except Exception:
+            pass
+
+        # Attempt 2 — search for closest title
+        if not found:
+            try:
+                params   = {"action":"query","list":"search",
+                            "srsearch":query,"format":"json"}
+                r2       = req.get("https://en.wikipedia.org/w/api.php",
+                                   headers=headers, params=params, timeout=5)
+                results  = r2.json()["query"]["search"]
+                if results:
+                    best    = results[0]["title"]
+                    url2    = ("https://en.wikipedia.org/api/rest_v1/page/summary/"
+                               + best.replace(" ","_"))
+                    r3      = req.get(url2, headers=headers, timeout=5)
+                    data2   = r3.json()
+                    if "extract" in data2 and data2["extract"]:
+                        summary = data2["extract"]
+                        short   = ". ".join(summary.split(". ")[:2])
+                        if not short.endswith("."): short += "."
+                        speak(short)
+                        found = True
+            except Exception:
+                pass
+
+        if not found:
+            speak("I could not find that on Wikipedia. Opening Chrome.")
+            open_chrome_search(query)
+
+    except Exception as e:
+        speak("Sorry, something went wrong with the search!")
+        print("Wikipedia error:", e)
+
+
+# ============================================================
+#   WEATHER
+# ============================================================
+
+def get_weather(city):
+    target = city if city else SETTINGS["default_city"]
+    url    = (
+        "https://api.openweathermap.org/data/2.5/weather"
+        f"?q={target}&appid={WEATHER_API_KEY}&units=metric"
+    )
+    try:
+        response = req.get(url, timeout=5)
         data     = response.json()
-        if data["cod"] == 200:
+        if data.get("cod") == 200:
             temp       = round(data["main"]["temp"])
             feels_like = round(data["main"]["feels_like"])
             condition  = data["weather"][0]["description"]
             humidity   = data["main"]["humidity"]
             city_name  = data["name"]
             heat = (
-                "It is very hot outside, stay hydrated!" if temp >= 35 else
-                "It is warm outside."                    if temp >= 28 else
-                "The weather is quite pleasant!"         if temp >= 20 else
-                "It is a bit cool outside!"
+                "Very hot outside, stay hydrated!"  if temp >= 35 else
+                "Warm and sunny outside."           if temp >= 28 else
+                "Quite pleasant outside!"           if temp >= 20 else
+                "A bit cool outside."               if temp >= 10 else
+                "Cold outside, dress warmly!"
             )
             speak(
-                f"Weather for {city_name}: {temp} degrees, feels like {feels_like}. "
-                f"Sky: {condition}. Humidity {humidity} percent. {heat}"
+                f"Weather for {city_name}: "
+                f"{temp} degrees, feels like {feels_like}. "
+                f"{condition}. Humidity {humidity} percent. {heat}"
             )
         else:
-            speak("Sorry I could not find weather for " + city)
+            speak(f"Sorry, I could not find weather for {target}.")
     except Exception as e:
-        speak("Sorry I could not get the weather right now!")
-        logging.error(f"get_weather() error: {e}")
+        speak("Sorry, I could not get the weather right now!")
+        print("Weather error:", e)
 
-# ============================================
-#   CONSTANTS
-# ============================================
-WAKE_WORDS    = ["hey sky", "hi sky", "sky", "wake up"]
-SLEEP_TIMEOUT = 600
 
-# ============================================
-#   ASSISTANT LOOP — runs in background thread
-# ============================================
+# ============================================================
+#   OPEN APPS
+# ============================================================
+
+def open_app(command):
+    try:
+        app = (command or "").lower().strip()
+        if "notepad" in app:
+            speak("Opening Notepad!")
+            os.startfile("notepad.exe")
+        elif "chrome" in app or "browser" in app:
+            speak("Opening Chrome!")
+            os.startfile("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe")
+        elif "explorer" in app or "files" in app:
+            speak("Opening File Explorer!")
+            os.startfile("explorer.exe")
+        elif "calculator" in app or "calc" in app:
+            speak("Opening Calculator!")
+            os.startfile("calc.exe")
+        elif "camera" in app:
+            speak("Opening Camera!")
+            subprocess.Popen("start microsoft.windows.camera:", shell=True)
+        elif "music" in app or "media player" in app:
+            speak("Opening Media Player!")
+            os.startfile("wmplayer.exe")
+        elif "excel" in app:
+            speak("Opening Excel!")
+            os.startfile("excel.exe")
+        elif "word" in app:
+            speak("Opening Word!")
+            os.startfile("winword.exe")
+        elif "task manager" in app:
+            speak("Opening Task Manager!")
+            os.startfile("taskmgr.exe")
+        else:
+            speak("Sorry, I do not know how to open that yet!")
+    except Exception as e:
+        speak("Sorry, I could not open that application!")
+        print("App error:", e)
+
+
+# ============================================================
+#   MAIN PROGRAM
+# ============================================================
+
 def run_assistant():
-    global last_query
+    global last_query, SETTINGS
 
+    # Start reminder checker
     threading.Thread(target=check_reminders, daemon=True).start()
+
+    ai_name   = SETTINGS["ai_name"]
+    user_name = SETTINGS["user_name"]
 
     is_awake      = False
     last_activity = time.time()
 
     while True:
+        # Refresh from settings in case user changed them
+        ai_name      = SETTINGS["ai_name"]
+        user_name    = SETTINGS["user_name"]
+        wake_words   = SETTINGS["wake_words"]
+        sleep_timeout = SETTINGS["sleep_timeout"]
+
         check_alerts()
 
-        # ── SLEEP MODE ───────────────────────
+        # ── SLEEP MODE ───────────────────────────────────────
         if not is_awake:
-            if gui:
-                gui.set_status("sleeping")
-                gui.is_awake = False
+            print(f"😴 {ai_name} sleeping...")
             command = listen()
             check_alerts()
             if not command:
@@ -757,7 +1253,7 @@ def run_assistant():
 
             woke_up           = False
             remaining_command = ""
-            for wake in WAKE_WORDS:
+            for wake in wake_words:
                 if wake in command:
                     woke_up           = True
                     remaining_command = command.replace(wake, "").strip()
@@ -768,10 +1264,8 @@ def run_assistant():
 
             is_awake      = True
             last_activity = time.time()
-            if gui:
-                gui.set_status("listening")
-                gui.is_awake = True
-            speak("Yes Boss")
+            speak(f"Yes {user_name}!")
+            print(f"👀 {ai_name} is awake")
 
             if remaining_command:
                 command = remaining_command
@@ -782,117 +1276,150 @@ def run_assistant():
                     continue
                 last_activity = time.time()
 
-        # ── AWAKE MODE ───────────────────────
+        # ── AWAKE MODE ───────────────────────────────────────
         else:
-            if gui:
-                gui.set_status("listening")
+            print(f"👀 {ai_name} listening...")
             command = listen(timeout=15)
             check_alerts()
 
             if not command:
-                if time.time() - last_activity > SLEEP_TIMEOUT:
+                if time.time() - last_activity > sleep_timeout:
                     is_awake = False
-                    if gui:
-                        gui.log("info", "Going to sleep after inactivity.")
+                    print(f"😴 {ai_name} went to sleep — inactivity")
                 continue
 
             last_activity = time.time()
 
-        # ── PROCESS ──────────────────────────
-        if gui:
-            gui.set_status("thinking")
+        # ── SEND TO GEMINI ───────────────────────────────────
+        print(f"🗣️  Processing: '{command}'")
+        understood = understand_command(command)
+        intent     = understood.get("intent", "unknown")
+        print(f"✅ Intent: {intent}")
 
-        if "hello" in command or "hi" in command:
-            speak("Hello there! Great to hear from you!")
+        # ── EXECUTE INTENT ───────────────────────────────────
 
-        elif "how are you" in command:
+        if intent == "greeting":
+            speak(f"Hello {user_name}! Great to hear from you!")
+
+        elif intent == "how_are_you":
             speak("I am doing great! Thank you for asking!")
 
-        elif "your name" in command:
-            speak("My name is Sky, your personal voice assistant!")
+        elif intent == "name":
+            speak(
+                f"My name is {ai_name}, your personal AI voice assistant "
+                "powered by Google Gemini!"
+            )
 
-        elif "time" in command and "date" in command:
-            speak("Today is " + datetime.datetime.now().strftime("%B %d %Y") +
-                  " and the time is " + datetime.datetime.now().strftime("%I:%M %p"))
+        elif intent == "time_and_date":
+            speak(
+                "Today is "
+                + datetime.datetime.now().strftime("%B %d %Y")
+                + " and the time is "
+                + datetime.datetime.now().strftime("%I:%M %p") + "."
+            )
 
-        elif "time" in command and "timer" not in command:
-            speak("The current time is " + datetime.datetime.now().strftime("%I:%M %p"))
+        elif intent == "time":
+            speak("The current time is "
+                  + datetime.datetime.now().strftime("%I:%M %p") + ".")
 
-        elif "date" in command:
-            speak("Today is " + datetime.datetime.now().strftime("%B %d %Y"))
+        elif intent == "date":
+            speak("Today is "
+                  + datetime.datetime.now().strftime("%B %d %Y") + ".")
 
-        elif ("show" in command or "my" in command or "list" in command) and "reminder" in command:
+        elif intent == "reminder_set":
+            set_reminder(
+                understood.get("task"),
+                understood.get("time")
+            )
+
+        elif intent == "reminder_show":
             show_reminders()
 
-        elif "reminder" in command or "remind me" in command:
-            set_reminder(command)
+        elif intent == "timer":
+            set_timer(understood.get("duration"))
 
-        elif "timer" in command and "reminder" not in command:
-            set_timer(command)
+        elif intent == "note_take":
+            take_note(understood.get("task") or command)
 
-        elif ("show" in command or "read" in command or "my notes" in command) and "note" in command:
+        elif intent == "note_show":
             show_notes()
 
-        elif any(p in command for p in ["take a note","make a note","note down","save note"]):
-            take_note(command)
+        elif intent == "send_email":
+            send_email(understood.get("contact"))
 
-        elif "calculate" in command or is_math_question(command):
-            calculate(command)
+        elif intent == "add_contact":
+            add_contact(command)
 
-        elif "what is" in command or "what's" in command:
-            search_wikipedia(command)
+        elif intent == "calculate":
+            calculate(understood.get("expression") or command)
 
-        elif "search" in command and "it" in command and ("google" in command or "chrome" in command):
-            if last_query:
-                speak(f"Searching for {last_query}")
-                open_chrome_search(last_query)
-            else:
-                speak("I don't have a previous topic to search for!")
+        elif intent == "weather":
+            get_weather(understood.get("city"))
 
-        elif "search" in command:
-            query = command.split("search for")[-1].strip() if "search for" in command \
-                    else command.split("search")[-1].strip()
-            speak("Searching for " + query)
-            open_chrome_search(query)
-            last_query = query
+        elif intent == "wikipedia":
+            search_wikipedia(understood.get("topic") or command)
 
-        elif any(p in command for p in ["who is","tell me about","wikipedia","define"]):
-            search_wikipedia(command)
+        elif intent == "search":
+            topic = understood.get("topic") or command
+            speak(f"Searching for {topic}.")
+            open_chrome_search(topic)
+            last_query = topic
 
-        elif "weather" in command:
-            city = command.split("in")[-1].strip() if "in" in command else "Thrissur"
-            get_weather(city)
+        elif intent == "open_app":
+            open_app(understood.get("app") or command)
 
-        elif "open" in command:
-            open_app(command)
+        elif intent == "volume_control":
+            control_volume(
+                understood.get("task") or command,
+                understood.get("action"),
+                understood.get("value")
+            )
 
-        elif "joke" in command:
+        elif intent == "brightness_control":
+            control_brightness(
+                understood.get("task") or command,
+                understood.get("action"),
+                understood.get("value")
+            )
+
+        elif intent == "change":
+            customize(
+                understood.get("setting"),
+                understood.get("new_value"),
+                command
+            )
+
+        elif intent == "joke":
             jokes = [
                 "Why do programmers prefer dark mode? Because light attracts bugs!",
                 "Why did the computer go to the doctor? Because it had a virus!",
-                "What do you call a computer that sings? A Dell!"
+                "What do you call a computer that sings? A Dell!",
+                "Why do Java developers wear glasses? Because they don't C sharp!",
+                "How many programmers to change a light bulb? None — that is a hardware problem!",
+                "Why was the computer cold? It left its Windows open!",
             ]
             speak(random.choice(jokes))
 
-        elif "go to sleep" in command or "bye" in command or "exit" in command:
-            speak("Okay, going to sleep.")
+        elif intent == "small_talk":
+            reply = understood.get("reply") or "That is interesting! Tell me more."
+            speak(reply)
+
+        elif intent == "sleep":
+            speak(f"Okay, going to sleep. Goodbye {user_name}!")
             is_awake = False
 
         else:
-            speak("I heard " + command + ". I am still learning new commands!")
+            speak(
+                f"I heard: {command}. "
+                "I am not sure how to help with that yet!"
+            )
 
         check_alerts()
 
 
-# ============================================
-#   LAUNCH
-# ============================================
+# ============================================================
+#   START
+# ============================================================
+
 if __name__ == "__main__":
-    root = tk.Tk()
-    gui  = SkyDashboard(root)
-
-    # Run assistant in background thread
-    assistant_thread = threading.Thread(target=run_assistant, daemon=True)
-    assistant_thread.start()
-
-    root.mainloop()
+    run_assistant()
