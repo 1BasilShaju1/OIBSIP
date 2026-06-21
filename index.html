@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sky — AI Voice Assistant</title>
+<style>
+  :root {
+    --void: #05060a;
+    --panel: #0c0f17;
+    --panel-2: #11141d;
+    --line: #1b1f2b;
+    --text: #e8ecf5;
+    --dim: #6b7180;
+    --accent: #4d7cff;
+    --user-bubble: #161a26;
+    --ai-bubble: #0e1119;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--void);
+    color: var(--text);
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  #hero {
+    position: relative;
+    flex: 0 0 auto;
+    height: 46vh;
+    min-height: 280px;
+    background:
+      radial-gradient(ellipse at 50% 30%, rgba(77,124,255,0.06), transparent 60%),
+      var(--void);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    border-bottom: 1px solid var(--line);
+  }
+  #faceCanvas {
+    width: min(320px, 50vw);
+    height: min(320px, 50vw);
+  }
+  #waveCanvas {
+    width: 100%;
+    max-width: 900px;
+    height: 90px;
+    padding: 0 24px;
+  }
+  #heroFloor {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 70px;
+    background: radial-gradient(ellipse 40% 100% at 50% 100%, rgba(77,124,255,0.10), transparent 70%);
+    pointer-events: none;
+  }
+  #heroLabel {
+    position: absolute;
+    top: 18px;
+    left: 24px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  #heroLabel .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: #3ddc84;
+    box-shadow: 0 0 8px #3ddc84;
+  }
+  #heroLabel .dot.busy { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  #heroLabel b { color: var(--text); font-weight: 600; letter-spacing: 0.02em; }
+  #heroState {
+    position: absolute;
+    bottom: 84px;
+    font-size: 12.5px;
+    color: var(--dim);
+    letter-spacing: 0.02em;
+    height: 16px;
+  }
+
+  #chat {
+    flex: 1;
+    overflow-y: auto;
+    padding: 22px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: 760px;
+    margin: 0 auto;
+    width: 100%;
+    scrollbar-width: thin;
+    scrollbar-color: var(--line) transparent;
+  }
+  #chat::-webkit-scrollbar { width: 6px; }
+  #chat::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+
+  .bubble {
+    padding: 10px 14px;
+    border-radius: 14px;
+    max-width: 72%;
+    line-height: 1.45;
+    font-size: 14.5px;
+    animation: rise 0.22s ease-out;
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .user {
+    align-self: flex-end;
+    background: var(--user-bubble);
+    border: 1px solid var(--line);
+    border-bottom-right-radius: 4px;
+  }
+  .ai {
+    align-self: flex-start;
+    background: var(--ai-bubble);
+    border: 1px solid var(--line);
+    border-bottom-left-radius: 4px;
+  }
+  .ai .intent-tag {
+    display: block;
+    font-size: 10.5px;
+    color: var(--dim);
+    margin-top: 5px;
+    letter-spacing: 0.03em;
+  }
+
+  #inputBar {
+    border-top: 1px solid var(--line);
+    background: var(--panel);
+    padding: 14px 24px;
+    display: flex;
+    gap: 10px;
+    max-width: 760px;
+    margin: 0 auto;
+    width: 100%;
+    flex: 0 0 auto;
+  }
+  #textInput {
+    flex: 1;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--text);
+    padding: 11px 14px;
+    border-radius: 10px;
+    font-size: 14.5px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  #textInput:focus { border-color: var(--accent); }
+  #textInput::placeholder { color: var(--dim); }
+
+  button {
+    border: none;
+    border-radius: 10px;
+    padding: 11px 18px;
+    font-size: 14px;
+    cursor: pointer;
+    font-weight: 600;
+    transition: transform 0.1s, background 0.15s;
+  }
+  button:active { transform: scale(0.97); }
+  #sendBtn { background: var(--accent); color: white; }
+  #sendBtn:hover { background: #6190ff; }
+
+  #micBtn {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line);
+    width: 46px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #micBtn svg { width: 18px; height: 18px; }
+  #micBtn.listening {
+    background: #2a1414;
+    border-color: #5a2a2a;
+    color: #ff6b6b;
+  }
+  #micBtn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+  #browserWarning {
+    background: #241c0e;
+    color: #e8b75c;
+    padding: 7px 24px;
+    font-size: 12px;
+    text-align: center;
+    display: none;
+    flex: 0 0 auto;
+  }
+
+  @media (max-width: 560px) {
+    #hero { height: 38vh; min-height: 220px; }
+    .bubble { max-width: 85%; }
+  }
+</style>
+</head>
+<body>
+
+<div id="browserWarning">Voice input needs Chrome or Edge. Text chat works everywhere.</div>
+
+<div id="hero">
+  <div id="heroLabel"><span class="dot" id="stateDot"></span><b id="aiNameHeader">Sky</b><span>&nbsp;is online</span></div>
+  <canvas id="faceCanvas" width="320" height="320"></canvas>
+  <div id="heroState"></div>
+  <canvas id="waveCanvas" width="900" height="90"></canvas>
+  <div id="heroFloor"></div>
+</div>
+
+<div id="chat"></div>
+
+<div id="inputBar">
+  <button id="micBtn" title="Click and speak" aria-label="Toggle voice input">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+      <line x1="12" y1="19" x2="12" y2="23"></line>
+      <line x1="8" y1="23" x2="16" y2="23"></line>
+    </svg>
+  </button>
+  <input id="textInput" type="text" placeholder="Type or click the mic to speak..." autocomplete="off">
+  <button id="sendBtn">Send</button>
+</div>
+
+<script>
+function getUserId() {
+  let id = localStorage.getItem("sky_user_id");
+  if (!id) {
+    id = "user_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    localStorage.setItem("sky_user_id", id);
+  }
+  return id;
+}
+const USER_ID = getUserId();
+const API_BASE = "";
+
+const chatEl = document.getElementById("chat");
+const textInput = document.getElementById("textInput");
+const sendBtn = document.getElementById("sendBtn");
+const micBtn = document.getElementById("micBtn");
+const heroState = document.getElementById("heroState");
+const stateDot = document.getElementById("stateDot");
+
+function setState(label, busy) {
+  heroState.textContent = label || "";
+  stateDot.classList.toggle("busy", !!busy);
+}
+
+function addBubble(text, who, intent) {
+  const div = document.createElement("div");
+  div.className = "bubble " + who;
+  div.textContent = text;
+  if (intent) {
+    const tag = document.createElement("span");
+    tag.className = "intent-tag";
+    tag.textContent = "intent: " + intent;
+    div.appendChild(tag);
+  }
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+async function sendMessage(text) {
+  if (!text.trim()) return;
+  addBubble(text, "user");
+  textInput.value = "";
+  setState("Thinking...", true);
+
+  try {
+    const res = await fetch(API_BASE + "/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, user_id: USER_ID })
+    });
+    const data = await res.json();
+    addBubble(data.reply, "ai", data.intent);
+    speak(data.reply);
+  } catch (err) {
+    addBubble("Sorry, I couldn't reach the server. Is the backend running?", "ai");
+    setState("", false);
+    console.error(err);
+  }
+}
+
+sendBtn.addEventListener("click", () => sendMessage(textInput.value));
+textInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendMessage(textInput.value); });
+
+function speak(text) {
+  if (!("speechSynthesis" in window)) { setState("", false); return; }
+  window.speechSynthesis.cancel();
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.rate = 1.0;
+  utter.pitch = 1.0;
+  utter.onstart = () => { setState("Speaking...", true); wave.setMode("speaking"); face.setMode("speaking"); };
+  utter.onend   = () => { setState("", false); wave.setMode("idle"); face.setMode("idle"); };
+  utter.onerror = () => { setState("", false); wave.setMode("idle"); face.setMode("idle"); };
+  window.speechSynthesis.speak(utter);
+}
+
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognizing = false;
+let recognizer = null;
+let audioCtx, analyser, micStream, micSource;
+
+async function startMicAnalyser() {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    micSource = audioCtx.createMediaStreamSource(micStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    micSource.connect(analyser);
+  } catch (e) {
+    console.warn("Mic analyser unavailable:", e);
+    analyser = null;
+  }
+}
+function stopMicAnalyser() {
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  if (audioCtx) audioCtx.close();
+  analyser = null; audioCtx = null; micStream = null; micSource = null;
+}
+
+if (!SpeechRecognition) {
+  document.getElementById("browserWarning").style.display = "block";
+  micBtn.disabled = true;
+} else {
+  recognizer = new SpeechRecognition();
+  recognizer.lang = "en-US";
+  recognizer.interimResults = false;
+  recognizer.maxAlternatives = 1;
+
+  recognizer.onstart = async () => {
+    recognizing = true;
+    micBtn.classList.add("listening");
+    setState("Listening...", true);
+    await startMicAnalyser();
+    wave.setMode("listening", analyser);
+    face.setMode("listening");
+  };
+  recognizer.onresult = (event) => sendMessage(event.results[0][0].transcript);
+  recognizer.onerror = (event) => setState("Mic error: " + event.error, false);
+  recognizer.onend = () => {
+    recognizing = false;
+    micBtn.classList.remove("listening");
+    stopMicAnalyser();
+    wave.setMode("idle");
+    face.setMode("idle");
+    if (heroState.textContent === "Listening...") setState("", false);
+  };
+  micBtn.addEventListener("click", () => {
+    if (recognizing) recognizer.stop(); else recognizer.start();
+  });
+}
+
+const wave = (() => {
+  const canvas = document.getElementById("waveCanvas");
+  const ctx = canvas.getContext("2d");
+  let mode = "idle";
+  let liveAnalyser = null;
+  let t = 0;
+
+  function resize() {
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * devicePixelRatio;
+    canvas.height = rect.height * devicePixelRatio;
+  }
+  window.addEventListener("resize", resize);
+
+  function setMode(m, analyserNode) {
+    mode = m;
+    liveAnalyser = analyserNode || null;
+  }
+
+  function drawBars(amps) {
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const n = amps.length;
+    const gap = w / n;
+    const barW = Math.max(1.5, gap * 0.45);
+    ctx.fillStyle = mode === "idle" ? "rgba(107,113,128,0.5)" : "#9db6ff";
+    for (let i = 0; i < n; i++) {
+      const amp = amps[i];
+      const barH = Math.max(2, amp * h * 0.9);
+      const x = i * gap + gap / 2 - barW / 2;
+      const y = (h - barH) / 2;
+      ctx.beginPath();
+      const r = barW / 2;
+      if (ctx.roundRect) { ctx.roundRect(x, y, barW, barH, r); } else { ctx.rect(x, y, barW, barH); }
+      ctx.fill();
+    }
+  }
+
+  function frame() {
+    t += 0.06;
+    const barCount = 64;
+    let amps = new Array(barCount).fill(0.04);
+
+    if (mode === "listening" && liveAnalyser) {
+      const data = new Uint8Array(liveAnalyser.frequencyBinCount);
+      liveAnalyser.getByteTimeDomainData(data);
+      const step = Math.floor(data.length / barCount) || 1;
+      for (let i = 0; i < barCount; i++) {
+        const v = Math.abs((data[i * step] - 128) / 128);
+        amps[i] = Math.min(1, v * 2.2);
+      }
+    } else if (mode === "speaking") {
+      for (let i = 0; i < barCount; i++) {
+        const envelope = Math.sin((i / barCount) * Math.PI);
+        const noise = 0.55 + 0.45 * Math.sin(t * 6 + i * 0.7) * Math.sin(t * 2.3 + i * 0.31);
+        amps[i] = Math.max(0.05, envelope * Math.abs(noise));
+      }
+    } else {
+      for (let i = 0; i < barCount; i++) {
+        const envelope = 0.3 + 0.7 * Math.sin((i / barCount) * Math.PI);
+        amps[i] = envelope * (0.12 + 0.06 * Math.sin(t * 1.1 + i * 0.5));
+      }
+    }
+    drawBars(amps);
+    requestAnimationFrame(frame);
+  }
+
+  resize();
+  requestAnimationFrame(frame);
+  return { setMode };
+})();
+
+const face = (() => {
+  const canvas = document.getElementById("faceCanvas");
+  const ctx = canvas.getContext("2d");
+  let mode = "idle";
+  let t = 0;
+  const DPR = Math.min(devicePixelRatio || 1, 2);
+
+  function resize() {
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * DPR;
+    canvas.height = rect.height * DPR;
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  function buildPoints() {
+    const pts = [];
+    const cx = 0, cy = 0;
+
+    // head outline: egg shape, narrower at jaw, wider at temple.
+    // Denser sampling (0.05 step) so neighboring points stay close
+    // enough for connecting lines to actually draw.
+    for (let a = 0; a < Math.PI * 2; a += 0.05) {
+      const rx = 0.58, ry = 0.86;
+      const jawNarrow = a > Math.PI * 0.15 && a < Math.PI * 0.85 ? 1 - 0.12 * Math.sin((a - Math.PI * 0.15) / (Math.PI * 0.7) * Math.PI) : 1;
+      pts.push({ x: cx + Math.cos(a) * rx * jawNarrow, y: cy + Math.sin(a) * ry, group: "outline" });
+    }
+
+    // brow ridge: two short straight-ish strokes above each eye
+    [-1, 1].forEach(side => {
+      for (let i = 0; i <= 6; i++) {
+        const x = side * (0.10 + i * 0.025);
+        pts.push({ x: cx + x, y: cy - 0.22 - 0.015 * i, group: "brow" });
+      }
+    });
+
+    // eyes: proper almond shape via two arcs (upper lid + lower lid)
+    // meeting at inner/outer corners, traced as a closed loop.
+    [-0.25, 0.25].forEach(ex => {
+      const w = 0.115, h = 0.05;
+      for (let a = 0; a <= Math.PI; a += 0.35) {
+        pts.push({ x: cx + ex + Math.cos(a) * w, y: cy - 0.05 - Math.sin(a) * h, group: "eye" }); // upper lid
+      }
+      for (let a = 0; a <= Math.PI; a += 0.35) {
+        pts.push({ x: cx + ex - Math.cos(a) * w, y: cy - 0.05 + Math.sin(a) * h * 0.6, group: "eye" }); // lower lid
+      }
+    });
+
+    // nose: bridge down to two nostril flares
+    for (let y = -0.08; y <= 0.16; y += 0.03) {
+      const spread = 0.015 + Math.max(0, y + 0.04) * 0.5;
+      pts.push({ x: cx - spread, y: cy + y, group: "nose" });
+      pts.push({ x: cx + spread, y: cy + y, group: "nose" });
+    }
+
+    // mouth: closed curve, upper + lower lip line
+    for (let x = -0.16; x <= 0.16; x += 0.025) {
+      pts.push({ x: cx + x, y: cy + 0.36 - 0.025 * Math.cos(x * 9), group: "mouth" });
+      pts.push({ x: cx + x, y: cy + 0.40 + 0.02 * Math.cos(x * 7), group: "mouth" });
+    }
+
+    // internal mesh fill - RANDOMIZED scatter (not concentric rings,
+    // which draw as visible circles since every point has equal-
+    // distance same-ring neighbors). Random placement is what gives
+    // the organic "web" texture seen in wireframe-face references.
+    let seed = 42;
+    function rand() { // deterministic so the face doesn't reshuffle every reload
+      seed = (seed * 9301 + 49297) % 233280;
+      return seed / 233280;
+    }
+    for (let i = 0; i < 90; i++) {
+      const a = rand() * Math.PI * 2;
+      const r = Math.sqrt(rand()) * 0.78; // sqrt for uniform area density
+      pts.push({ x: cx + Math.cos(a) * r * 0.56, y: cy + Math.sin(a) * r * 0.82 - 0.03, group: "fill" });
+    }
+
+    return pts;
+  }
+  const basePoints = buildPoints();
+
+  function setMode(m) { mode = m; }
+
+  function frame() {
+    t += 0.016;
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const scale = Math.min(w, h) * 0.46;
+    const ox = w / 2, oy = h / 2;
+
+    const energy = mode === "speaking" ? 1 : mode === "listening" ? 0.7 : 0.25;
+    const jitter = mode === "idle" ? 0.006 : 0.014;
+    const pulse = mode === "idle" ? 0 : 0.02 * Math.sin(t * (mode === "speaking" ? 10 : 6));
+
+    const projected = basePoints.map((p, i) => {
+      const n = Math.sin(t * 0.6 + i * 0.37) * jitter + Math.cos(t * 0.4 + i * 0.21) * jitter;
+      return {
+        x: ox + (p.x + n) * scale * (1 + pulse),
+        y: oy + (p.y + n) * scale * (1 + pulse),
+        group: p.group
+      };
+    });
+
+    ctx.lineWidth = 0.8 * DPR;
+    for (let i = 0; i < projected.length; i++) {
+      for (let j = i + 1; j < projected.length; j++) {
+        const a = projected[i], b = projected[j];
+        const d = Math.hypot(a.x - b.x, a.y - b.y);
+        const maxD = scale * 0.12;
+        if (d < maxD) {
+          const alpha = (1 - d / maxD) * (0.22 + energy * 0.18);
+          ctx.strokeStyle = `rgba(157,182,255,${alpha})`;
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.stroke();
+        }
+      }
+    }
+
+    for (const p of projected) {
+      const r = (p.group === "fill" ? 1.1 : 1.6) * DPR;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(232,236,245,${0.55 + energy * 0.35})`;
+      ctx.fill();
+    }
+
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+  return { setMode };
+})();
+
+addBubble("Sky is ready. Type a message or click the mic to speak.", "ai");
+</script>
+
+</body>
+</html>
